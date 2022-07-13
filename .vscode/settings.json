@@ -1,0 +1,6 @@
+{
+    "files.associations": {
+        "ls1c_delay.h": "c",
+        "ssd1306.h": "c"
+    }
+}
