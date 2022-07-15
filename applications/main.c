@@ -2,30 +2,49 @@
 #include <rtthread.h>  
 #include <rtdevice.h>
 #include <mpu6xxx.h>
-
+#include "paho_mqtt.h"
 #include <string.h>
 #include <stdio.h>
 #include "ssd1306.h"
- 
+#include <U8g2lib.h>
 #include "app_esp8266.h"
 #include <sensor.h>
-
+#include <ntp.h>
 #define DBG_LEVEL   DBG_LOG
 #include <rtdbg.h>
 #define LOG_TAG                "example.hr"
 #include "driver_max30205_basic.h"
-
+static MQTTClient client;
+#include "drv_dht11.h"
 #define THREAD_PRIORITY         25
 #define THREAD_STACK_SIZE       512
 #define THREAD_TIMESLICE        5
-
+#define MQTT_Uri    "mqtts.heclouds.com"   // MQTT服务器的地址和端口号
+#define ClientId    "534850"                // ClientId需要唯一
+#define UserName    "ESP8266"                    // 用户名
+#define PassWord    "1234567"                    // 用户名对应的密码
+#define key_gpio 85
 /*  静态线程1 的对象和运行时用到的栈 */  
 static struct rt_thread thread1;
 static rt_uint8_t thread1_stack[THREAD_STACK_SIZE]; 
 
 /*  动态线程2 的对象 */  
 static rt_thread_t thread2 = RT_NULL;
+ #define ONENET_TOPIC_PROP_POST "$sys/" mqtt_pubid "/" mqtt_devid "/dp/post/json" //"$sys/" mqtt_pubid "/" mqtt_devid "/thing/property/post"
+//接收下发属性设置主题
+#define ONENET_TOPIC_PROP_SET  "$sys/" mqtt_pubid "/" mqtt_devid "/dp/post/json/+" //"$sys/" mqtt_pubid "/" mqtt_devid "/thing/property/set"
+//接收下发属性设置成功的回复主题
+#define ONENET_TOPIC_PROP_SET_REPLY "$sys/" mqtt_pubid "/" mqtt_devid "/dp/post/accepted" //"$sys/" mqtt_pubid "/" mqtt_devid "/thing/property/set_reply"
  
+//接收设备属性获取命令主题
+#define ONENET_TOPIC_PROP_GET "$sys/" mqtt_pubid "/" mqtt_devid "/cmd/request/+" //"$sys/" mqtt_pubid "/" mqtt_devid "/thing/property/get"
+//接收设备属性获取命令成功的回复主题
+#define ONENET_TOPIC_PROP_GET_REPLY "$sys/" mqtt_pubid "/" mqtt_devid "/cmd/response/+/+" //"$sys/" mqtt_pubid "/" mqtt_devid "/thing/property/get_reply"
+ 
+//这是post上传数据使用的模板
+#define ONENET_POST_BODY_FORMAT "{\"id\":%d,\"dp\":%s}"
+//#define ONENET_POST_BODY_FORMAT
+int postMsgId = 0; //记录已经post了多少条
 
 /* Default configuration, please change according to the actual situation, support i2c and spi device name */
 #define MPU6XXX_DEVICE_NAME  "i2c1"
@@ -36,6 +55,7 @@ static rt_timer_t timer2;
 
 int16_t ax, ay, az;
 int16_t gx, gy, gz;
+float temp, humi;
 int axoffs,ayoffs,azoffs;
 float rax,ray,raz;
 float ax0,ay0,az0;
@@ -53,9 +73,158 @@ int count=0;
     struct mpu6xxx_device *dev;
     struct mpu6xxx_3axes accel, gyro;
     int ge,shi,bai,qian;
+#define DHT11_DATA_PIN GET_PIN(B, 12)
+
+ void read_temp()
+{
+    rt_device_t dev = RT_NULL;
+    struct rt_sensor_data sensor_data;
+    rt_size_t res;
+
+    dev = rt_device_find(parameter);
+    if (dev == RT_NULL)
+    {
+        rt_kprintf("Can't find device:%s\n", parameter);
+        return;
+    }
+
+    if (rt_device_open(dev, RT_DEVICE_FLAG_RDWR) != RT_EOK)
+    {
+        rt_kprintf("open device failed!\n");
+        return;
+    }
+    rt_device_control(dev, RT_SENSOR_CTRL_SET_ODR, (void *)100);
+
+        res = rt_device_read(dev, 0, &sensor_data, 1);
+        if (res != 1)
+        {
+            rt_kprintf("read data failed!size is %d\n", res);
+            rt_device_close(dev);
+            return;
+        }
+        else
+        {
+            if (sensor_data.data.temp >= 0)
+            {
+
+							uint8_t temp = (sensor_data.data.temp & 0xffff) >> 0;      // get temp
+              uint8_t humi = (sensor_data.data.temp & 0xffff0000) >> 16; // get humi
+							rt_kprintf("temp:%d, humi:%d\n" ,temp, humi);
+            }
+        }
+        rt_thread_mdelay(100);
+    }
+void key_scan()
+{
+    int folag;
+    if (gpio_level_low != gpio_get(key_gpio))
+    delay_ms(10);
+    if (gpio_level_low != gpio_get(key_gpio))
+    folag++;
+    oled_display(folag); 
+    while (gpio_level_high != gpio_get(key_gpio));
+    delay_ms(10);
+    if (folag>=2)
+    {
+        folag=0;
+    }
+}
+void draw1()
+{
+   timerAlarmEnable(tim1);//
+  u8g2.clearBuffer();
+  u8g2.setCursor(0, 31);
+  u8g2.print("当前时间:");
+  u8g2.setCursor(70, 31);
+  u8g2.print("10:");
+   u8g2.setCursor(90, 31);
+  u8g2.print("35:");
+   u8g2.setCursor(110, 31);
+  u8g2.print(t);
+ // u8g2.clearBuffer();
+  u8g2.setCursor(0, 49);
+  u8g2.print("2022/07/13");
+  u8g2.setCursor(80, 49);
+   u8g2.print("星期三");
+  
+  u8g2.setCursor(0, 15);
+  u8g2.print("温度:");
+  u8g2.setCursor(30 , 15);
+  u8g2.print("tem");
+  u8g2.setCursor(50, 15);
+  u8g2.print("℃");
+
+  u8g2.setCursor(65, 15);
+  u8g2.print("湿度:");
+  u8g2.setCursor(100, 15);
+  u8g2.print("73");
+  u8g2.setCursor(118, 15);
+  u8g2.print("%");
+
+  u8g2.setCursor(0, 64);
+  u8g2.print("天气:");
+  u8g2.setCursor(35, 64);
+  u8g2.print("小雨");
+  u8g2.sendBuffer();
+   }
+
+void oled_display()
+{
+    u8g2.begin();
+    u8g2.clearBuffer();
+
+    u8g2.setFont(u8g2_font_logisoso32_tf);
+    u8g2.setCursor(48+3, 42);
+    u8g2.print("体温：");    
+
+    u8g2.setFont(u8g2_font_6x13_tr);            
+    u8g2.drawStr(30, 60, tem);   
+    u8g2.sendBuffer();
+
+    sht3x_device_t  sht3x_device;
+    sht3x_device = sht3x_init("i2c1", 0x44);
+
+    rt_thread_mdelay(2000);
+
+    int status = 0;
+    char mstr[3];
+    char hstr[3];
+    time_t now;
+    struct tm *p;
+    int min = 0, hour = 0;
+    int temperature = 0,humidity = 0;
+
+    while(1)
+    {
+        switch(status)
+        {
+            case 0:
+                now = time(RT_NULL);
+                p=gmtime((const time_t*) &now);
+                hour = p->tm_hour;
+                min = p->tm_min;
+                sprintf(mstr, "%02d", min);
+                sprintf(hstr, "%02d", hour);
 
 
+                u8g2.firstPage();
+                do {
+                     u8g2.setFont(u8g2_font_logisoso42_tn);
+                     u8g2.drawStr(0,63,"脉搏");
+                     u8g2.drawStr(50,63,":");
+                     u8g2.drawStr(67,63,"心率：");
+                   } while ( u8g2.nextPage() );
 
+
+                rt_thread_mdelay(5000);
+                status = 1;
+                break;
+          case 1：
+          draw1();
+           break;
+        }
+    }
+}
 
 static int mpu6xxx_st()
 {
@@ -113,9 +282,6 @@ static int mpu6xxx_test()
 
     int i;
 
-    
-
-    
         mpu6xxx_get_accel(dev, &accel);
         mpu6xxx_get_gyro(dev, &gyro);
     ax=accel.x;
@@ -134,9 +300,6 @@ static int mpu6xxx_test()
     az1=(raz/16384)*9.80;
      rt_kprintf("ax1 = %3d, ay1 = %3d, az1 = %3d ", ax1, ay1, az1 );
         //rt_thread_mdelay(1000);
-   
-
-   // mpu6xxx_deinit(dev);
 
     return 0;
 }
@@ -182,12 +345,6 @@ void ssd1306_wr(int sum_in ,int pos)
     ssd1306_WriteString(str, Font_7x10, White);
 
     }
-
-
-
-
-
-    
 
     ssd1306_UpdateScreen();
 }
@@ -253,11 +410,6 @@ void test_thread_04(void)
 {
 	rt_err_t result; 
 
-	/*  初始化线程1 */ 
-	/*  线程的入口是thread1_entry ，参数是RT_NULL 
-	 *  线程栈是thread1_stack 栈空间是512 ，  
-	 *  优先级是25 ，时间片是5个OS Tick 
-	 */  
 	result = rt_thread_init(&thread1, "thread1", 
 			thread1_entry, RT_NULL, 
 			&thread1_stack[0], sizeof(thread1_stack), 
@@ -265,11 +417,7 @@ void test_thread_04(void)
 
 	/*  启动线程1 */  
 	if (result == RT_EOK) rt_thread_startup(&thread1); 
-
-	/*  创建线程2 */ 
-	/*  线程的入口是thread2_entry,  参数是RT_NULL 
-	 *  栈空间是512 ，优先级是25 ，时间片是5个OS Tick 
-	 */  
+ 
 	thread2 = rt_thread_create( "thread2", thread2_entry, RT_NULL, 
 			THREAD_STACK_SIZE, THREAD_PRIORITY, THREAD_TIMESLICE); 
 
@@ -278,11 +426,26 @@ void test_thread_04(void)
 }
 int main()
 {
-  test_thread_04();    
+  test_thread_04();   
+   //NTP自动对时
+   time_t cur_time;
+   cur_time = ntp_sync_to_rtc(NULL);
+   if (cur_time)
+   {
+       rt_kprintf("Cur Time: %s", ctime((const time_t*) &cur_time));
+   }
+   else
+   {
+       rt_kprintf("NTP sync fail.\n");
+   } 
   while (1)
   {    
-  rt_thread_mdelay(1000);  
-}
+    key_scan();
+    read_temp();
+    onenet_upload_cycle();
+    oled_display();
+    rt_thread_mdelay(100);  
+ }
 }
 
 
